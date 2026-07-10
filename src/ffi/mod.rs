@@ -12,6 +12,26 @@ use ioctl_sys::ioctl;
 #[allow(non_upper_case_globals)]
 #[allow(non_snake_case)]
 #[allow(dead_code)]
+#[cfg(target_os = "macos")]
+#[path = "pfvar_macos.rs"]
+pub mod pfvar;
+
+// FreeBSD's <net/pfvar.h> is generated from a newer/different pf(4) codebase than macOS's
+// (which tracks upstream OpenBSD pf closely). Bindings were generated with:
+//   bindgen --allowlist-type pf_status --allowlist-type pfioc_rule \
+//       --allowlist-type pfioc_pooladdr --allowlist-type pfioc_trans \
+//       --allowlist-type pfioc_states --allowlist-type pfioc_state_kill \
+//       --allowlist-type pfioc_iface --allowlist-var 'PF_.*' \
+//       --allowlist-var 'PFRULE_.*' --default-enum-style rust \
+//       -o src/ffi/pfvar_freebsd.rs /usr/include/net/pfvar.h -- -DPRIVATE -I/usr/include
+// See freebsd_notes.md for the struct-level differences from macOS that this crate's code
+// has to account for.
+#[allow(non_camel_case_types)]
+#[allow(non_upper_case_globals)]
+#[allow(non_snake_case)]
+#[allow(dead_code)]
+#[cfg(target_os = "freebsd")]
+#[path = "pfvar_freebsd.rs"]
 pub mod pfvar;
 
 pub mod tcp {
@@ -31,6 +51,13 @@ pub mod tcp {
 // The definitions of the ioctl calls come from pfvar.h. Look for the comment "ioctl operations"
 // The documentation describing the order of calls and accepted parameters can be found at:
 // http://man.openbsd.org/pf.4
+//
+// ioctl command numbers (the b'D' group + number) are identical between macOS and FreeBSD for
+// every operation below -- verified against a FreeBSD 14.3-RELEASE /usr/include/net/pfvar.h.
+// The one difference is DIOCINSERTRULE/DIOCDELETERULE (27/28), which FreeBSD's pf(4) dropped
+// entirely (header comment: "XXX cut 26 - 28"), along with the PF_CHANGE_* constants that
+// DIOCCHANGERULE's macOS callers rely on. Those two ioctls, and the anchor add/remove code that
+// depends on them, are therefore macOS-only here; see anchor management notes in lib.rs.
 // DIOCSTART
 ioctl!(none pf_start with b'D', 1);
 // DIOCSTOP
@@ -47,11 +74,15 @@ ioctl!(readwrite pf_clear_states with b'D', 18; pfvar::pfioc_state_kill);
 ioctl!(readwrite pf_get_status with b'D', 21; pfvar::pf_status);
 // DIOCGETSTATES
 ioctl!(readwrite pf_get_states with b'D', 25; pfvar::pfioc_states);
-// DIOCCHANGERULE
+// DIOCCHANGERULE (macOS only -- see comment above; FreeBSD has the ioctl but not the PF_CHANGE_*
+// verbs pfctl-rs's macOS code relies on)
+#[cfg(target_os = "macos")]
 ioctl!(readwrite pf_change_rule with b'D', 26; pfvar::pfioc_rule);
-// DIOCINSERTRULE
+// DIOCINSERTRULE (macOS/OpenBSD only, removed on FreeBSD)
+#[cfg(target_os = "macos")]
 ioctl!(readwrite pf_insert_rule with b'D', 27; pfvar::pfioc_rule);
-// DIOCDELETERULE
+// DIOCDELETERULE (macOS/OpenBSD only, removed on FreeBSD)
+#[cfg(target_os = "macos")]
 ioctl!(readwrite pf_delete_rule with b'D', 28; pfvar::pfioc_rule);
 // DIOCKILLSTATES
 ioctl!(readwrite pf_kill_states with b'D', 41; pfvar::pfioc_state_kill);

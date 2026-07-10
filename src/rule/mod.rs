@@ -375,11 +375,25 @@ impl CopyTo<ffi::pfvar::pf_addr_wrap> for IpNetwork {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl CopyTo<ffi::pfvar::pf_addr> for IpAddr {
     fn copy_to(&self, pf_addr: &mut ffi::pfvar::pf_addr) {
         match *self {
             IpAddr::V4(ip) => ip.copy_to(unsafe { &mut pf_addr.pfa._v4addr }),
             IpAddr::V6(ip) => ip.copy_to(unsafe { &mut pf_addr.pfa._v6addr }),
+        }
+    }
+}
+
+// FreeBSD's `pf_addr` union field is named `__bindgen_anon_1` (bindgen-synthesized, since the
+// union in FreeBSD's pfvar.h is itself anonymous, unlike macOS's which names it `pfa`), with
+// members `v4`/`v6` instead of macOS's `_v4addr`/`_v6addr`.
+#[cfg(target_os = "freebsd")]
+impl CopyTo<ffi::pfvar::pf_addr> for IpAddr {
+    fn copy_to(&self, pf_addr: &mut ffi::pfvar::pf_addr) {
+        match *self {
+            IpAddr::V4(ip) => ip.copy_to(unsafe { &mut pf_addr.__bindgen_anon_1.v4 }),
+            IpAddr::V6(ip) => ip.copy_to(unsafe { &mut pf_addr.__bindgen_anon_1.v6 }),
         }
     }
 }

@@ -16,9 +16,15 @@
 //!
 //! # OS Compatibility
 //!
-//! PF is the firewall used in most (all?) BSD systems, but this crate only supports the macOS
-//! variant for now. If it can be made to work on more BSD systems that would be great, but no work
-//! has been put into that so far.
+//! PF is the firewall used in most (all?) BSD systems. This crate primarily supports the macOS
+//! variant. A `target_os = "freebsd"` port exists but is **partial**: it covers the
+//! transaction-based rule-application path (`PfCtl::set_rules`/`flush_rules`, everything
+//! `talpid-core`'s macOS firewall backend uses to apply/replace an anchor's ruleset) as well as
+//! `enable`/`disable`/`is_enabled`/`get_states`/`kill_state`/interface flags. It does **not**
+//! cover `add_anchor`/`remove_anchor`/`with_anchor_rule`/`clear_states`, which on macOS rely on
+//! the `DIOCINSERTRULE`/`DIOCDELETERULE` ioctls and `PF_CHANGE_*` verbs that FreeBSD's pf(4)
+//! dropped from its ioctl ABI entirely (no like-for-like replacement has been verified yet). See
+//! `freebsd_notes.md` in this repository for details and open questions.
 //!
 //! # Usage and examples
 //!
@@ -125,6 +131,12 @@ pub enum ErrorKind {
     AnchorDoesNotExist,
     /// System returned an error during ioctl system call
     Ioctl,
+    /// This operation is not implemented on the current platform.
+    ///
+    /// Currently only produced on `target_os = "freebsd"`, for operations that rely on
+    /// ioctls/verbs (`DIOCINSERTRULE`, `DIOCDELETERULE`, `PF_CHANGE_*`) that macOS's pf(4)
+    /// exposes but FreeBSD's does not. See `freebsd_notes.md` in this repository.
+    Unsupported,
 }
 
 #[derive(Debug)]
@@ -145,6 +157,7 @@ enum ErrorInternal {
     StateAlreadyActive,
     AnchorDoesNotExist,
     Ioctl(std::io::Error),
+    Unsupported(&'static str),
 }
 
 impl Error {
@@ -165,6 +178,7 @@ impl Error {
             StateAlreadyActive => ErrorKind::StateAlreadyActive,
             AnchorDoesNotExist => ErrorKind::AnchorDoesNotExist,
             Ioctl(_) => ErrorKind::Ioctl,
+            Unsupported(_) => ErrorKind::Unsupported,
         }
     }
 }
@@ -196,6 +210,7 @@ impl fmt::Display for Error {
             StateAlreadyActive => write!(f, "Target state is already active"),
             AnchorDoesNotExist => write!(f, "Anchor does not exist"),
             Ioctl(_) => write!(f, "Error during ioctl syscall"),
+            Unsupported(reason) => write!(f, "Not implemented on this platform: {reason}"),
         }
     }
 }
@@ -310,6 +325,17 @@ impl PfCtl {
         Ok(pf_status.running == 1)
     }
 
+    /// Adds an anchor rule (a rule in the parent ruleset that hands evaluation off to a named
+    /// sub-ruleset) to PF.
+    ///
+    /// # Platform notes
+    ///
+    /// On macOS this uses `DIOCINSERTRULE`. FreeBSD's pf(4) does not have that ioctl (nor the
+    /// `PF_CHANGE_*` verbs `DIOCCHANGERULE` would need to emulate it) -- see the module-level
+    /// docs. No verified FreeBSD equivalent exists yet, so this returns
+    /// `ErrorKind::Unsupported` there rather than guessing at semantics that would rewrite the
+    /// live root pf ruleset.
+    #[cfg(target_os = "macos")]
     pub fn add_anchor(&mut self, name: &str, kind: AnchorKind) -> Result<()> {
         let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
 
@@ -320,16 +346,37 @@ impl PfCtl {
         Ok(())
     }
 
+    /// See the macOS implementation of this method; unsupported on FreeBSD for the same reason.
+    #[cfg(target_os = "freebsd")]
+    pub fn add_anchor(&mut self, _name: &str, _kind: AnchorKind) -> Result<()> {
+        Err(Error::from(ErrorInternal::Unsupported(
+            "add_anchor: DIOCINSERTRULE does not exist on FreeBSD's pf(4); no verified \
+             replacement implemented yet",
+        )))
+    }
+
     /// Same as `add_anchor`, but `StateAlreadyActive` errors are supressed and exchanged for
     /// `Ok(())`.
     pub fn try_add_anchor(&mut self, name: &str, kind: AnchorKind) -> Result<()> {
         ignore_error_kind!(self.add_anchor(name, kind), ErrorKind::StateAlreadyActive)
     }
 
+    /// See [`PfCtl::add_anchor`]'s platform notes; the same caveat applies here since this is
+    /// implemented in terms of `DIOCDELETERULE`, which FreeBSD's pf(4) also lacks.
+    #[cfg(target_os = "macos")]
     pub fn remove_anchor(&mut self, name: &str, kind: AnchorKind) -> Result<()> {
         self.with_anchor_rule(name, kind, |mut anchor_rule| {
             ioctl_guard!(ffi::pf_delete_rule(self.fd(), &mut anchor_rule))
         })
+    }
+
+    /// See the macOS implementation of this method; unsupported on FreeBSD for the same reason.
+    #[cfg(target_os = "freebsd")]
+    pub fn remove_anchor(&mut self, _name: &str, _kind: AnchorKind) -> Result<()> {
+        Err(Error::from(ErrorInternal::Unsupported(
+            "remove_anchor: DIOCDELETERULE does not exist on FreeBSD's pf(4); no verified \
+             replacement implemented yet",
+        )))
     }
 
     /// Same as `remove_anchor`, but `AnchorDoesNotExist` errors are supressed and exchanged for
@@ -341,7 +388,14 @@ impl PfCtl {
         )
     }
 
+    /// Adds a single filter rule directly (outside of a transaction), via `DIOCCHANGERULE`.
+    ///
+    /// Not used by `talpid-core`'s macOS firewall backend (it goes through
+    /// [`PfCtl::set_rules`]/[`Transaction`] instead, which only needs `DIOCADDRULE` +
+    /// `DIOCXBEGIN`/`DIOCXCOMMIT`, all present on FreeBSD). Kept macOS-only since the
+    /// `PF_CHANGE_ADD_TAIL` verb it relies on does not exist on FreeBSD.
     // TODO(linus): Make more generic. No hardcoded ADD_TAIL etc.
+    #[cfg(target_os = "macos")]
     pub fn add_rule(&mut self, anchor: &str, rule: &FilterRule) -> Result<()> {
         let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
 
@@ -360,6 +414,9 @@ impl PfCtl {
         trans.commit()
     }
 
+    /// Not used by `talpid-core`'s macOS firewall backend; see [`PfCtl::add_rule`]'s notes on why
+    /// this stays macOS-only (relies on `PF_CHANGE_ADD_TAIL`, absent on FreeBSD).
+    #[cfg(target_os = "macos")]
     pub fn add_nat_rule(&mut self, anchor: &str, rule: &NatRule) -> Result<()> {
         // prepare pfioc_rule
         let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
@@ -387,6 +444,9 @@ impl PfCtl {
         ioctl_guard!(ffi::pf_change_rule(self.fd(), &mut pfioc_rule))
     }
 
+    /// Not used by `talpid-core`'s macOS firewall backend; see [`PfCtl::add_rule`]'s notes on why
+    /// this stays macOS-only (relies on `PF_CHANGE_ADD_TAIL`, absent on FreeBSD).
+    #[cfg(target_os = "macos")]
     pub fn add_redirect_rule(&mut self, anchor: &str, rule: &RedirectRule) -> Result<()> {
         // prepare pfioc_rule
         let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
@@ -412,6 +472,9 @@ impl PfCtl {
         ioctl_guard!(ffi::pf_change_rule(self.fd(), &mut pfioc_rule))
     }
 
+    /// Not used by `talpid-core`'s macOS firewall backend; see [`PfCtl::add_rule`]'s notes on why
+    /// this stays macOS-only (relies on `PF_CHANGE_ADD_TAIL`, absent on FreeBSD).
+    #[cfg(target_os = "macos")]
     pub fn add_scrub_rule(&mut self, anchor: &str, rule: &ScrubRule) -> Result<()> {
         let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
 
@@ -440,6 +503,11 @@ impl PfCtl {
     /// Clear states created by rules in anchor.
     /// Returns total number of removed states upon success, otherwise
     /// ErrorKind::AnchorDoesNotExist if anchor does not exist.
+    ///
+    /// Relies on [`PfCtl::with_anchor_rule`], which is macOS-only (see its docs) since it
+    /// requires reading the anchor's rule number out of the top-level ruleset via a mechanism
+    /// this fork hasn't ported to FreeBSD yet.
+    #[cfg(target_os = "macos")]
     pub fn clear_states(&mut self, anchor_name: &str, kind: AnchorKind) -> Result<u32> {
         let pfsync_states = self.get_states_inner()?;
         if !pfsync_states.is_empty() {
@@ -463,8 +531,19 @@ impl PfCtl {
         }
     }
 
+    /// See the macOS implementation of this method; unsupported on FreeBSD for the same reason
+    /// (depends on [`PfCtl::with_anchor_rule`]).
+    #[cfg(target_os = "freebsd")]
+    pub fn clear_states(&mut self, _anchor_name: &str, _kind: AnchorKind) -> Result<u32> {
+        Err(Error::from(ErrorInternal::Unsupported(
+            "clear_states: depends on the same anchor-rule-lookup mechanism as add_anchor/\
+             remove_anchor, not yet ported to FreeBSD",
+        )))
+    }
+
     /// Clear states belonging to a given interface
     /// Returns total number of removed states upon success
+    #[cfg(target_os = "macos")]
     pub fn clear_interface_states(&mut self, interface: Interface) -> Result<u32> {
         let mut pfioc_state_kill = unsafe { mem::zeroed::<ffi::pfvar::pfioc_state_kill>() };
         interface.try_copy_to(&mut pfioc_state_kill.psk_ifname)?;
@@ -472,6 +551,21 @@ impl PfCtl {
         ioctl_guard!(ffi::pf_clear_states(self.fd(), &mut pfioc_state_kill))?;
         // psk_af holds the number of killed states
         Ok(pfioc_state_kill.psk_af as u32)
+    }
+
+    /// Clear states belonging to a given interface
+    /// Returns total number of removed states upon success
+    ///
+    /// Unlike macOS (which overloads `psk_af` to also carry the killed-state count back from the
+    /// kernel), FreeBSD's `pfioc_state_kill` has a dedicated `psk_killed: u_int` field for this,
+    /// which is used here instead.
+    #[cfg(target_os = "freebsd")]
+    pub fn clear_interface_states(&mut self, interface: Interface) -> Result<u32> {
+        let mut pfioc_state_kill = unsafe { mem::zeroed::<ffi::pfvar::pfioc_state_kill>() };
+        interface.try_copy_to(&mut pfioc_state_kill.psk_ifname)?;
+
+        ioctl_guard!(ffi::pf_clear_states(self.fd(), &mut pfioc_state_kill))?;
+        Ok(pfioc_state_kill.psk_killed)
     }
 
     /// Get all states created by stateful rules
@@ -490,6 +584,18 @@ impl PfCtl {
     /// Remove the specified state.
     ///
     /// All current states can be obtained via [get_states].
+    #[cfg(target_os = "macos")]
+    pub fn kill_state(&mut self, state: &State) -> Result<()> {
+        let mut pfioc_state_kill = unsafe { mem::zeroed::<ffi::pfvar::pfioc_state_kill>() };
+        setup_pfioc_state_kill(state.as_raw(), &mut pfioc_state_kill);
+        ioctl_guard!(ffi::pf_kill_states(self.fd(), &mut pfioc_state_kill))?;
+        Ok(())
+    }
+
+    /// Remove the specified state.
+    ///
+    /// All current states can be obtained via [get_states].
+    #[cfg(target_os = "freebsd")]
     pub fn kill_state(&mut self, state: &State) -> Result<()> {
         let mut pfioc_state_kill = unsafe { mem::zeroed::<ffi::pfvar::pfioc_state_kill>() };
         setup_pfioc_state_kill(state.as_raw(), &mut pfioc_state_kill);
@@ -529,7 +635,21 @@ impl PfCtl {
     }
 
     /// Get all states created by stateful rules
+    #[cfg(target_os = "macos")]
     fn get_states_inner(&mut self) -> Result<Vec<ffi::pfvar::pfsync_state>> {
+        let num_states = self.get_num_states()?;
+        if num_states > 0 {
+            let (mut pfioc_states, pfsync_states) = setup_pfioc_states(num_states);
+            ioctl_guard!(ffi::pf_get_states(self.fd(), &mut pfioc_states))?;
+            Ok(pfsync_states)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Get all states created by stateful rules
+    #[cfg(target_os = "freebsd")]
+    fn get_states_inner(&mut self) -> Result<Vec<ffi::pfvar::pfsync_state_1301>> {
         let num_states = self.get_num_states()?;
         if num_states > 0 {
             let (mut pfioc_states, pfsync_states) = setup_pfioc_states(num_states);
@@ -549,6 +669,12 @@ impl PfCtl {
     /// - Returns Result<R> from call to closure on match.
     /// - Returns `ErrorKind::AnchorDoesNotExist` on mismatch, the closure is not called in that
     ///   case.
+    ///
+    /// macOS-only: relies on `DIOCGETRULE`'s `nr`-indexed iteration semantics being paired with
+    /// `DIOCDELETERULE`/`DIOCINSERTRULE` to be useful, which is only true on macOS (see module
+    /// docs). Reading rules this way still works on FreeBSD in principle, but nothing consumes
+    /// it there yet.
+    #[cfg(target_os = "macos")]
     fn with_anchor_rule<F, R>(&self, name: &str, kind: AnchorKind, f: F) -> Result<R>
     where
         F: FnOnce(ffi::pfvar::pfioc_rule) -> Result<R>,
@@ -568,10 +694,21 @@ impl PfCtl {
     }
 
     /// Returns global number of states created by all stateful rules (see keep_state)
+    #[cfg(target_os = "macos")]
     fn get_num_states(&self) -> Result<u32> {
         let mut pfioc_states = unsafe { mem::zeroed::<ffi::pfvar::pfioc_states>() };
         ioctl_guard!(ffi::pf_get_states(self.fd(), &mut pfioc_states))?;
         let element_size = mem::size_of::<ffi::pfvar::pfsync_state>() as u32;
+        let buffer_size = pfioc_states.ps_len as u32;
+        Ok(buffer_size / element_size)
+    }
+
+    /// Returns global number of states created by all stateful rules (see keep_state)
+    #[cfg(target_os = "freebsd")]
+    fn get_num_states(&self) -> Result<u32> {
+        let mut pfioc_states = unsafe { mem::zeroed::<ffi::pfvar::pfioc_states>() };
+        ioctl_guard!(ffi::pf_get_states(self.fd(), &mut pfioc_states))?;
+        let element_size = mem::size_of::<ffi::pfvar::pfsync_state_1301>() as u32;
         let buffer_size = pfioc_states.ps_len as u32;
         Ok(buffer_size / element_size)
     }
@@ -586,6 +723,7 @@ impl PfCtl {
 /// given number of elements.
 /// Since pfioc_states uses raw memory pointer to Vec<pfsync_state>, make sure that
 /// Vec<pfsync_state> outlives pfsync_states.
+#[cfg(target_os = "macos")]
 fn setup_pfioc_states(
     num_states: u32,
 ) -> (ffi::pfvar::pfioc_states, Vec<ffi::pfvar::pfsync_state>) {
@@ -599,7 +737,26 @@ fn setup_pfioc_states(
     (pfioc_states, pfsync_states)
 }
 
+/// Creates pfioc_states and returns a tuple of pfioc_states and vector of pfsync_state_1301 with
+/// the given number of elements.
+/// Since pfioc_states uses a raw memory pointer to the Vec, make sure the Vec outlives
+/// pfioc_states.
+#[cfg(target_os = "freebsd")]
+fn setup_pfioc_states(
+    num_states: u32,
+) -> (ffi::pfvar::pfioc_states, Vec<ffi::pfvar::pfsync_state_1301>) {
+    let mut pfioc_states = unsafe { mem::zeroed::<ffi::pfvar::pfioc_states>() };
+    let element_size = mem::size_of::<ffi::pfvar::pfsync_state_1301>() as i32;
+    pfioc_states.ps_len = element_size * (num_states as i32);
+    let mut pfsync_states = (0..num_states)
+        .map(|_| unsafe { mem::zeroed::<ffi::pfvar::pfsync_state_1301>() })
+        .collect::<Vec<_>>();
+    pfioc_states.__bindgen_anon_1.ps_states = pfsync_states.as_mut_ptr();
+    (pfioc_states, pfsync_states)
+}
+
 /// Setup pfioc_state_kill from pfsync_state
+#[cfg(target_os = "macos")]
 fn setup_pfioc_state_kill(
     pfsync_state: &ffi::pfvar::pfsync_state,
     pfioc_state_kill: &mut ffi::pfvar::pfioc_state_kill,
@@ -610,6 +767,24 @@ fn setup_pfioc_state_kill(
     pfioc_state_kill.psk_ifname = pfsync_state.ifname;
     pfioc_state_kill.psk_src.addr.v.a.addr = pfsync_state.lan.addr;
     pfioc_state_kill.psk_dst.addr.v.a.addr = pfsync_state.ext_lan.addr;
+}
+
+/// Setup pfioc_state_kill from pfsync_state_1301.
+///
+/// Uses `key[0]` (the "wire" key, `PF_SK_WIRE`) for src/dst, matching the local/remote mapping
+/// `state.rs`'s FreeBSD `State::local_address`/`remote_address` use. `psk_proto` is a bare `int`
+/// on FreeBSD (there is no separate `psk_proto_variant` field/concept here), and there is no
+/// `psk_ownername` field to worry about.
+#[cfg(target_os = "freebsd")]
+fn setup_pfioc_state_kill(
+    pfsync_state: &ffi::pfvar::pfsync_state_1301,
+    pfioc_state_kill: &mut ffi::pfvar::pfioc_state_kill,
+) {
+    pfioc_state_kill.psk_af = pfsync_state.af;
+    pfioc_state_kill.psk_proto = pfsync_state.proto as std::os::raw::c_int;
+    pfioc_state_kill.psk_ifname = pfsync_state.ifname;
+    pfioc_state_kill.psk_src.addr.v.a.addr = pfsync_state.key[0].addr[0];
+    pfioc_state_kill.psk_dst.addr.v.a.addr = pfsync_state.key[0].addr[1];
 }
 
 #[cfg(test)]

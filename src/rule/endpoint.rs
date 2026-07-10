@@ -91,6 +91,7 @@ impl From<SocketAddr> for Endpoint {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl TryCopyTo<ffi::pfvar::pf_rule_addr> for Endpoint {
     type Error = crate::Error;
 
@@ -98,6 +99,40 @@ impl TryCopyTo<ffi::pfvar::pf_rule_addr> for Endpoint {
         self.ip.copy_to(&mut pf_rule_addr.addr);
         self.port
             .try_copy_to(unsafe { &mut pf_rule_addr.xport.range })?;
+        Ok(())
+    }
+}
+
+// FreeBSD's `pf_rule_addr` has no `xport` union (there is no `pf_rule_xport` type at all on
+// FreeBSD); the port range is inlined directly as `port: [u16; 2]` + `port_op: u8`, equivalent
+// in shape to macOS's `pf_port_range`. Write to those fields directly instead of going through
+// `Port`'s `TryCopyTo<pf_port_range>` impl, which targets a type that doesn't exist here.
+#[cfg(target_os = "freebsd")]
+impl TryCopyTo<ffi::pfvar::pf_rule_addr> for Endpoint {
+    type Error = crate::Error;
+
+    fn try_copy_to(&self, pf_rule_addr: &mut ffi::pfvar::pf_rule_addr) -> crate::Result<()> {
+        self.ip.copy_to(&mut pf_rule_addr.addr);
+        match self.port {
+            Port::Any => {
+                pf_rule_addr.port_op = ffi::pfvar::PF_OP_NONE as u8;
+                pf_rule_addr.port[0] = 0;
+                pf_rule_addr.port[1] = 0;
+            }
+            Port::One(port, modifier) => {
+                pf_rule_addr.port_op = modifier.into();
+                pf_rule_addr.port[0] = port.to_be();
+                pf_rule_addr.port[1] = 0;
+            }
+            Port::Range(start_port, end_port, modifier) => {
+                if start_port > end_port {
+                    return Err(crate::Error::from(crate::ErrorInternal::InvalidPortRange));
+                }
+                pf_rule_addr.port_op = modifier.into();
+                pf_rule_addr.port[0] = start_port.to_be();
+                pf_rule_addr.port[1] = end_port.to_be();
+            }
+        }
         Ok(())
     }
 }

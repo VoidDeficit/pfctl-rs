@@ -23,6 +23,7 @@ impl From<u16> for Port {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl TryCopyTo<ffi::pfvar::pf_port_range> for Port {
     type Error = crate::Error;
 
@@ -53,6 +54,13 @@ impl TryCopyTo<ffi::pfvar::pf_port_range> for Port {
     }
 }
 
+// FreeBSD's `pfvar.h` has no `pf_port_range` type at all; this crate's only two consumers of
+// `TryCopyTo<pf_port_range>` are `Endpoint`'s `pf_rule_addr` impl (see rule/endpoint.rs, which
+// has its own FreeBSD-specific impl writing directly to `pf_rule_addr.port`/`port_op`) and no
+// one else. So there is intentionally no FreeBSD impl of this trait for `pf_port_range` --
+// nothing needs it.
+
+#[cfg(target_os = "macos")]
 impl TryCopyTo<ffi::pfvar::pf_pool> for Port {
     type Error = crate::Error;
 
@@ -73,6 +81,41 @@ impl TryCopyTo<ffi::pfvar::pf_pool> for Port {
                     return Err(Error::from(ErrorInternal::InvalidPortRange));
                 }
                 pf_pool.port_op = modifier.into();
+                pf_pool.proxy_port[0] = start_port;
+                pf_pool.proxy_port[1] = end_port;
+            }
+        }
+        Ok(())
+    }
+}
+
+// FreeBSD's `pf_pool` has no `port_op` field (only macOS/OpenBSD's does) -- the port-operator
+// concept (equal/range/exclusive/...) for NAT/redirect proxy ports doesn't exist in FreeBSD's
+// struct at all, only a plain `proxy_port: [u16; 2]`. This is best-effort: `Port::Any` and
+// `Port::One` both just set `proxy_port[0]` (with `[1]` left at 0, matching "no explicit second
+// bound"), and `Port::Range` sets both bounds; there is no way to express the
+// exclusive/inclusive/except distinction `PortRangeModifier` carries. Not used by
+// `talpid-core`'s firewall backend today (only reachable via `NatEndpoint`, which is only
+// exercised by the macOS 14.6-15.1 NAT_WORKAROUND path, itself gated `target_os = "macos"` in
+// `macos.rs`), but must still compile since `port.rs` is compiled unconditionally.
+#[cfg(target_os = "freebsd")]
+impl TryCopyTo<ffi::pfvar::pf_pool> for Port {
+    type Error = crate::Error;
+
+    fn try_copy_to(&self, pf_pool: &mut ffi::pfvar::pf_pool) -> crate::Result<()> {
+        match *self {
+            Port::Any => {
+                pf_pool.proxy_port[0] = 0;
+                pf_pool.proxy_port[1] = 0;
+            }
+            Port::One(port, _modifier) => {
+                pf_pool.proxy_port[0] = port;
+                pf_pool.proxy_port[1] = 0;
+            }
+            Port::Range(start_port, end_port, _modifier) => {
+                if start_port > end_port {
+                    return Err(Error::from(ErrorInternal::InvalidPortRange));
+                }
                 pf_pool.proxy_port[0] = start_port;
                 pf_pool.proxy_port[1] = end_port;
             }

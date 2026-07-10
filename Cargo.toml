@@ -32,3 +32,14 @@ tun = "0.7.4"
 # All of these belong to 'tun'
 ipnet = "2.6.0"
 log = "0.4.22"
+
+# `ioctl-sys` 0.8.0 upstream (https://github.com/jmesmon/ioctl) hardcodes an allowlist of
+# target_os values for its ioctl-encoding constants (linux/macos/openbsd/android) and hits a
+# deliberate compile error (`use platform_not_supported`) on anything else, including FreeBSD --
+# even though FreeBSD's ioctl encoding (see /usr/include/sys/ioccom.h) is bit-for-bit identical
+# to OpenBSD's. This points at a local fork (`../ioctl-sys-freebsd`) that adds a `freebsd.rs`
+# platform module, a straight copy of upstream's `openbsd.rs`. This is a local development
+# stopgap; a real fix should go upstream to jmesmon/ioctl, or the crate should be forked properly
+# on GitHub the same way pfctl-rs itself is being forked here.
+[patch.crates-io]
+ioctl-sys = { path = "../ioctl-sys-freebsd" }

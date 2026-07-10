@@ -6,7 +6,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::{AnchorKind, Error, ErrorInternal, PoolAddr, Result, conversion::TryCopyTo, ffi};
+#[cfg(target_os = "macos")]
+use crate::AnchorKind;
+use crate::{Error, ErrorInternal, PoolAddr, Result, conversion::TryCopyTo, ffi};
 use std::{
     fs::{File, OpenOptions},
     mem,
@@ -44,6 +46,11 @@ pub fn get_pool_ticket(fd: RawFd) -> Result<u32> {
     Ok(pfioc_pooladdr.ticket)
 }
 
+/// Only used by the (macOS-only) direct `DIOCCHANGERULE`-based `PfCtl::add_rule`/`add_nat_rule`/
+/// `add_redirect_rule`/`add_scrub_rule` methods; FreeBSD lacks `PF_CHANGE_GET_TICKET`. The
+/// transaction path (`Transaction::commit`, used by `set_rules`/`flush_rules`) gets its tickets
+/// from `DIOCXBEGIN` instead and does not call this.
+#[cfg(target_os = "macos")]
 pub fn get_ticket(fd: RawFd, anchor: &str, kind: AnchorKind) -> Result<u32> {
     let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
     pfioc_rule.action = ffi::pfvar::PF_CHANGE_GET_TICKET as u32;
