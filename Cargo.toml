@@ -21,6 +21,13 @@ libc = "0.2.29"
 derive_builder = "0.20"
 ipnetwork = "0.21.1"
 
+# Used only on FreeBSD, to build/pack the nvlist payloads DIOCADDRULENV expects (see
+# src/nv.rs). Its `libnv-sys` build script only links `-lnv` under `target_os = "freebsd"`
+# (no-op elsewhere), but the dependency itself is still kept OS-gated here so it never even
+# attempts to build on macOS.
+[target.'cfg(target_os = "freebsd")'.dependencies]
+libnv = "0.5.2"
+
 [dev-dependencies]
 assert_matches = "1.1.0"
 uuid = { version = "1.8.0", features = ["v4"] }

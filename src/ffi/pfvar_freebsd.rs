@@ -1555,3 +1555,25 @@ pub struct pfi_dynaddr {
 pub struct pfr_ktable {
     pub _address: u8,
 }
+// `pfioc_nv` is declared in `netpfil/pf/pf.h`, not `net/pfvar.h` (the header this file's
+// bindings were generated from), so bindgen never saw it. It is hand-added here rather than
+// regenerated, since the struct is trivial (three fields) and stable across the pf(4) nvlist
+// ioctl ABI: see `struct pfioc_nv` in /usr/include/netpfil/pf/pf.h on a FreeBSD 14.x system.
+// Used by `DIOCADDRULENV` (see ffi/mod.rs) for the nvlist-based anchor rule add path, which is
+// how `pfctl(8)` itself manages anchor contents on FreeBSD (verified via ktrace against
+// `pfctl -a <anchor> -f <file>`) now that `DIOCINSERTRULE`/`DIOCDELETERULE` are gone.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct pfioc_nv {
+    pub data: *mut ::std::os::raw::c_void,
+    pub len: usize,
+    pub size: usize,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of pfioc_nv"][::std::mem::size_of::<pfioc_nv>() - 24usize];
+    ["Alignment of pfioc_nv"][::std::mem::align_of::<pfioc_nv>() - 8usize];
+    ["Offset of field: pfioc_nv::data"][::std::mem::offset_of!(pfioc_nv, data) - 0usize];
+    ["Offset of field: pfioc_nv::len"][::std::mem::offset_of!(pfioc_nv, len) - 8usize];
+    ["Offset of field: pfioc_nv::size"][::std::mem::offset_of!(pfioc_nv, size) - 16usize];
+};

@@ -6,7 +6,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use crate::ffi;
+use crate::{ffi, RulesetKind};
 
 /// Enum describing the kinds of anchors
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -25,6 +25,21 @@ impl From<AnchorKind> for u8 {
             AnchorKind::Nat => ffi::pfvar::PF_NAT as u8,
             AnchorKind::Redirect => ffi::pfvar::PF_RDR as u8,
             AnchorKind::Scrub => ffi::pfvar::PF_SCRUB as u8,
+        }
+    }
+}
+
+/// Used on FreeBSD to pick which top-level ruleset (`PF_RULESET_*`) an anchor-call rule for a
+/// given `AnchorKind` belongs in, when opening the `DIOCXBEGIN`/`DIOCXCOMMIT` transaction that
+/// `add_anchor`/`remove_anchor` wrap their `DIOCADDRULENV` calls in.
+#[cfg(target_os = "freebsd")]
+impl From<AnchorKind> for RulesetKind {
+    fn from(anchor_kind: AnchorKind) -> RulesetKind {
+        match anchor_kind {
+            AnchorKind::Filter => RulesetKind::Filter,
+            AnchorKind::Nat => RulesetKind::Nat,
+            AnchorKind::Redirect => RulesetKind::Redirect,
+            AnchorKind::Scrub => RulesetKind::Scrub,
         }
     }
 }

@@ -64,6 +64,13 @@ ioctl!(none pf_start with b'D', 1);
 ioctl!(none pf_stop with b'D', 2);
 // DIOCADDRULE
 ioctl!(readwrite pf_add_rule with b'D', 4; pfvar::pfioc_rule);
+// DIOCADDRULENV (FreeBSD only; shares ioctl base number 4 with DIOCADDRULE but a different
+// payload struct/size, which BSD's ioctl encoding disambiguates -- see pfvar.h). This is how
+// FreeBSD's own pfctl(8) adds rules to a *named anchor's* ruleset (verified via ktrace); the
+// struct-based DIOCADDRULE above is only used by this crate's `Transaction`/`set_rules` path,
+// which operates tickets/tickets the same way on both OSes.
+#[cfg(target_os = "freebsd")]
+ioctl!(readwrite pf_add_rule_nv with b'D', 4; pfvar::pfioc_nv);
 // DIOCGETRULES
 ioctl!(readwrite pf_get_rules with b'D', 6; pfvar::pfioc_rule);
 // DIOCGETRULE

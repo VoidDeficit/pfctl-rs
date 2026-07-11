@@ -17,14 +17,17 @@
 //! # OS Compatibility
 //!
 //! PF is the firewall used in most (all?) BSD systems. This crate primarily supports the macOS
-//! variant. A `target_os = "freebsd"` port exists but is **partial**: it covers the
-//! transaction-based rule-application path (`PfCtl::set_rules`/`flush_rules`, everything
-//! `talpid-core`'s macOS firewall backend uses to apply/replace an anchor's ruleset) as well as
-//! `enable`/`disable`/`is_enabled`/`get_states`/`kill_state`/interface flags. It does **not**
-//! cover `add_anchor`/`remove_anchor`/`with_anchor_rule`/`clear_states`, which on macOS rely on
-//! the `DIOCINSERTRULE`/`DIOCDELETERULE` ioctls and `PF_CHANGE_*` verbs that FreeBSD's pf(4)
-//! dropped from its ioctl ABI entirely (no like-for-like replacement has been verified yet). See
-//! `freebsd_notes.md` in this repository for details and open questions.
+//! variant. A `target_os = "freebsd"` port also exists, covering everything `talpid-core`'s
+//! macOS firewall backend uses: the transaction-based rule-application path
+//! (`PfCtl::set_rules`/`flush_rules`), `enable`/`disable`/`is_enabled`/`get_states`/
+//! `kill_state`/interface flags, and anchor management (`add_anchor`/`remove_anchor`/
+//! `clear_states`). The latter three rely on macOS's `DIOCINSERTRULE`/`DIOCDELETERULE` ioctls
+//! and `PF_CHANGE_*` verbs, which FreeBSD's pf(4) dropped from its ioctl ABI entirely; the
+//! FreeBSD port instead uses the nvlist-based `DIOCADDRULENV` ioctl that FreeBSD's own
+//! `pfctl(8)` uses for the same purpose (verified via `ktrace` against real `pfctl -a ...`
+//! invocations) -- see `src/nv.rs`'s module docs for the full story, and `freebsd_notes.md` in
+//! this repository for the struct-level differences from macOS this port has to account for
+//! elsewhere.
 //!
 //! # Usage and examples
 //!
@@ -81,6 +84,12 @@ mod ffi;
 #[macro_use]
 mod macros;
 mod utils;
+
+/// FreeBSD-only: builds and sends the `DIOCADDRULENV` nvlist payload `add_anchor`/
+/// `remove_anchor` need. See `nv.rs`'s module docs for why this exists alongside the
+/// struct-based `DIOCADDRULE` path `Transaction` already uses.
+#[cfg(target_os = "freebsd")]
+mod nv;
 
 mod rule;
 pub use crate::rule::*;
@@ -330,11 +339,10 @@ impl PfCtl {
     ///
     /// # Platform notes
     ///
-    /// On macOS this uses `DIOCINSERTRULE`. FreeBSD's pf(4) does not have that ioctl (nor the
-    /// `PF_CHANGE_*` verbs `DIOCCHANGERULE` would need to emulate it) -- see the module-level
-    /// docs. No verified FreeBSD equivalent exists yet, so this returns
-    /// `ErrorKind::Unsupported` there rather than guessing at semantics that would rewrite the
-    /// live root pf ruleset.
+    /// Uses `DIOCINSERTRULE`. See the `target_os = "freebsd"` version of this method just below
+    /// for FreeBSD's equivalent, which uses the nvlist-based `DIOCADDRULENV` instead (FreeBSD's
+    /// pf(4) does not have `DIOCINSERTRULE`, nor the `PF_CHANGE_*` verbs `DIOCCHANGERULE` would
+    /// need to emulate it).
     #[cfg(target_os = "macos")]
     pub fn add_anchor(&mut self, name: &str, kind: AnchorKind) -> Result<()> {
         let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
@@ -346,13 +354,25 @@ impl PfCtl {
         Ok(())
     }
 
-    /// See the macOS implementation of this method; unsupported on FreeBSD for the same reason.
+    /// Adds an anchor-call rule to the root ruleset via `DIOCADDRULENV`, the nvlist-based
+    /// ioctl FreeBSD's own `pfctl(8)` uses to manage anchor contents (verified by `ktrace`
+    /// against `pfctl -a <name> -f <file>`; see `nv.rs`'s module docs for the full story on why
+    /// this needs a different ioctl than `Transaction`'s `DIOCADDRULE`).
+    ///
+    /// This mirrors macOS's `add_anchor`: it inserts a near-empty rule (`action = kind`,
+    /// `anchor_call = name`) into the *root* ruleset (anchor `""`), it does not touch `name`'s
+    /// own rule content -- that's what [`PfCtl::set_rules`]/[`PfCtl::flush_rules`] are for.
     #[cfg(target_os = "freebsd")]
-    pub fn add_anchor(&mut self, _name: &str, _kind: AnchorKind) -> Result<()> {
-        Err(Error::from(ErrorInternal::Unsupported(
-            "add_anchor: DIOCINSERTRULE does not exist on FreeBSD's pf(4); no verified \
-             replacement implemented yet",
-        )))
+    pub fn add_anchor(&mut self, name: &str, kind: AnchorKind) -> Result<()> {
+        let fd = self.fd();
+        let (ticket, pool_ticket) = utils::begin_ruleset_trans(fd, "", kind.into())?;
+
+        let mut rule = unsafe { mem::zeroed::<ffi::pfvar::pf_rule>() };
+        rule.action = kind.into();
+
+        nv::add_rule_nv(fd, &rule, "", name, ticket, pool_ticket)?;
+
+        utils::commit_ruleset_trans(fd, "", kind.into(), ticket)
     }
 
     /// Same as `add_anchor`, but `StateAlreadyActive` errors are supressed and exchanged for
@@ -361,8 +381,8 @@ impl PfCtl {
         ignore_error_kind!(self.add_anchor(name, kind), ErrorKind::StateAlreadyActive)
     }
 
-    /// See [`PfCtl::add_anchor`]'s platform notes; the same caveat applies here since this is
-    /// implemented in terms of `DIOCDELETERULE`, which FreeBSD's pf(4) also lacks.
+    /// Uses `DIOCDELETERULE`. See the `target_os = "freebsd"` version of this method further
+    /// down for FreeBSD's equivalent, which has no such ioctl.
     #[cfg(target_os = "macos")]
     pub fn remove_anchor(&mut self, name: &str, kind: AnchorKind) -> Result<()> {
         self.with_anchor_rule(name, kind, |mut anchor_rule| {
@@ -370,13 +390,47 @@ impl PfCtl {
         })
     }
 
-    /// See the macOS implementation of this method; unsupported on FreeBSD for the same reason.
+    /// Removes `name`'s anchor-call rule from the root ruleset.
+    ///
+    /// FreeBSD's pf(4) has no `DIOCDELETERULE`/`PF_CHANGE_*` to delete a single rule in place
+    /// (see module docs), so this instead does what committing a `pfctl`-style transaction for
+    /// the root ruleset always does: read back every existing anchor-call rule there via
+    /// [`PfCtl::with_anchor_rule`] (which only needs `DIOCGETRULES`/`DIOCGETRULE`, present on
+    /// both platforms), then re-commit the whole root ruleset with every entry *except* `name`
+    /// preserved. This only round-trips the minimal shape [`PfCtl::add_anchor`] itself creates
+    /// (`action` + `anchor_call`, nothing else) since that's the only kind of root-ruleset rule
+    /// this crate (or `talpid-core`'s firewall backend) ever adds there.
     #[cfg(target_os = "freebsd")]
-    pub fn remove_anchor(&mut self, _name: &str, _kind: AnchorKind) -> Result<()> {
-        Err(Error::from(ErrorInternal::Unsupported(
-            "remove_anchor: DIOCDELETERULE does not exist on FreeBSD's pf(4); no verified \
-             replacement implemented yet",
-        )))
+    pub fn remove_anchor(&mut self, name: &str, kind: AnchorKind) -> Result<()> {
+        let siblings = self.with_anchor_rule(name, kind, |_target| {
+            // Collect every *other* anchor-call rule in the root ruleset so it can be
+            // preserved across the rewrite below.
+            let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
+            pfioc_rule.rule.action = kind.into();
+            ioctl_guard!(ffi::pf_get_rules(self.fd(), &mut pfioc_rule))?;
+            let total = pfioc_rule.nr;
+            pfioc_rule.action = ffi::pfvar::PF_GET_NONE as u32;
+
+            let mut siblings = Vec::new();
+            for i in 0..total {
+                pfioc_rule.nr = i;
+                ioctl_guard!(ffi::pf_get_rule(self.fd(), &mut pfioc_rule))?;
+                if !compare_cstr_safe(name, &pfioc_rule.anchor_call) {
+                    let anchor_call = utils::cstr_field(&pfioc_rule.anchor_call).to_owned();
+                    siblings.push((pfioc_rule.rule.action, anchor_call));
+                }
+            }
+            Ok(siblings)
+        })?;
+
+        let fd = self.fd();
+        let (ticket, pool_ticket) = utils::begin_ruleset_trans(fd, "", kind.into())?;
+        for (action, anchor_call) in siblings {
+            let mut rule = unsafe { mem::zeroed::<ffi::pfvar::pf_rule>() };
+            rule.action = action;
+            nv::add_rule_nv(fd, &rule, "", &anchor_call, ticket, pool_ticket)?;
+        }
+        utils::commit_ruleset_trans(fd, "", kind.into(), ticket)
     }
 
     /// Same as `remove_anchor`, but `AnchorDoesNotExist` errors are supressed and exchanged for
@@ -531,14 +585,32 @@ impl PfCtl {
         }
     }
 
-    /// See the macOS implementation of this method; unsupported on FreeBSD for the same reason
-    /// (depends on [`PfCtl::with_anchor_rule`]).
+    /// See the macOS implementation of this method's docs. Identical logic: `DIOCGETRULES`/
+    /// `DIOCGETRULE` (what [`PfCtl::with_anchor_rule`] uses) work the same way on FreeBSD as on
+    /// macOS -- only the *write* side of anchor management (`DIOCADDRULENV` instead of
+    /// `DIOCINSERTRULE`/`DIOCDELETERULE`) differs between the two, and this method never
+    /// writes.
     #[cfg(target_os = "freebsd")]
-    pub fn clear_states(&mut self, _anchor_name: &str, _kind: AnchorKind) -> Result<u32> {
-        Err(Error::from(ErrorInternal::Unsupported(
-            "clear_states: depends on the same anchor-rule-lookup mechanism as add_anchor/\
-             remove_anchor, not yet ported to FreeBSD",
-        )))
+    pub fn clear_states(&mut self, anchor_name: &str, kind: AnchorKind) -> Result<u32> {
+        let pfsync_states = self.get_states_inner()?;
+        if !pfsync_states.is_empty() {
+            self.with_anchor_rule(anchor_name, kind, |anchor_rule| {
+                pfsync_states
+                    .iter()
+                    .filter(|pfsync_state| pfsync_state.anchor == anchor_rule.nr)
+                    .map(|pfsync_state| {
+                        let mut pfioc_state_kill =
+                            unsafe { mem::zeroed::<ffi::pfvar::pfioc_state_kill>() };
+                        setup_pfioc_state_kill(pfsync_state, &mut pfioc_state_kill);
+                        ioctl_guard!(ffi::pf_kill_states(self.fd(), &mut pfioc_state_kill))?;
+                        Ok(pfioc_state_kill.psk_killed)
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .map(|v| v.iter().sum())
+            })
+        } else {
+            Ok(0)
+        }
     }
 
     /// Clear states belonging to a given interface
@@ -670,11 +742,34 @@ impl PfCtl {
     /// - Returns `ErrorKind::AnchorDoesNotExist` on mismatch, the closure is not called in that
     ///   case.
     ///
-    /// macOS-only: relies on `DIOCGETRULE`'s `nr`-indexed iteration semantics being paired with
-    /// `DIOCDELETERULE`/`DIOCINSERTRULE` to be useful, which is only true on macOS (see module
-    /// docs). Reading rules this way still works on FreeBSD in principle, but nothing consumes
-    /// it there yet.
+    /// macOS-only in the sense that the closure receives a `pfioc_rule` the caller can pass
+    /// straight to `DIOCDELETERULE`/`DIOCCHANGERULE`, which don't exist on FreeBSD. The lookup
+    /// itself (`DIOCGETRULES`/`DIOCGETRULE`) works identically on both platforms; see the
+    /// `target_os = "freebsd"` version right below for the equivalent used by
+    /// `remove_anchor`/`clear_states` there.
     #[cfg(target_os = "macos")]
+    fn with_anchor_rule<F, R>(&self, name: &str, kind: AnchorKind, f: F) -> Result<R>
+    where
+        F: FnOnce(ffi::pfvar::pfioc_rule) -> Result<R>,
+    {
+        let mut pfioc_rule = unsafe { mem::zeroed::<ffi::pfvar::pfioc_rule>() };
+        pfioc_rule.rule.action = kind.into();
+        ioctl_guard!(ffi::pf_get_rules(self.fd(), &mut pfioc_rule))?;
+        pfioc_rule.action = ffi::pfvar::PF_GET_NONE as u32;
+        for i in 0..pfioc_rule.nr {
+            pfioc_rule.nr = i;
+            ioctl_guard!(ffi::pf_get_rule(self.fd(), &mut pfioc_rule))?;
+            if compare_cstr_safe(name, &pfioc_rule.anchor_call) {
+                return f(pfioc_rule);
+            }
+        }
+        Err(Error::from(ErrorInternal::AnchorDoesNotExist))
+    }
+
+    /// See the macOS implementation's docs just above. Same `DIOCGETRULES`/`DIOCGETRULE`
+    /// read-only lookup; the closure gets the raw `pfioc_rule` too (still useful for its `nr`,
+    /// e.g. in `clear_states`), it's just never fed to a delete/change ioctl on this platform.
+    #[cfg(target_os = "freebsd")]
     fn with_anchor_rule<F, R>(&self, name: &str, kind: AnchorKind, f: F) -> Result<R>
     where
         F: FnOnce(ffi::pfvar::pfioc_rule) -> Result<R>,
